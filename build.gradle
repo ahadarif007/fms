@@ -1,0 +1,58 @@
+plugins {
+	id 'java'
+	id 'org.springframework.boot' version '3.5.3'
+	id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'com.bracit.fms'
+version = '0.0.1-SNAPSHOT'
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(21)
+	}
+}
+
+repositories {
+	mavenCentral()
+}
+
+dependencies {
+	implementation 'org.springframework.boot:spring-boot-starter'
+	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+	implementation 'org.springframework.boot:spring-boot-starter-web'
+	implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+	// AWS S3
+	implementation 'software.amazon.awssdk:s3:2.21.29'
+
+	// MinIO
+	implementation 'io.minio:minio:8.5.7'
+
+	// Google Cloud Storage
+	implementation 'com.google.cloud:google-cloud-storage:2.29.1'
+
+	// Azure Storage
+	implementation 'com.azure:azure-storage-blob:12.23.0'
+
+	// Image processing
+	implementation 'net.coobird:thumbnailator:0.4.20'
+
+	// Utilities
+	implementation 'org.apache.commons:commons-lang3:3.13.0'
+	implementation 'commons-io:commons-io:2.15.1'
+
+	compileOnly 'org.projectlombok:lombok'
+	annotationProcessor 'org.projectlombok:lombok'
+
+	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+
+
+
+}
+
+tasks.named('test') {
+	useJUnitPlatform()
+}
