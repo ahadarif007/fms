@@ -19,12 +19,22 @@ public class FileStorageProperties {
     private Gcs gcs = new Gcs();
     private Azure azure = new Azure();
     private Image image = new Image();
+    private Compression compression = new Compression();
 
     @Data
     public static class Local {
         private String basePath = "./uploads";
     }
 
+    @Data
+    public static class Compression {
+        private boolean enabled = true;
+        private double minSavingsThreshold = 0.15; // 15%
+        private long maxFileSizeBytes = 100 * 1024 * 1024; // 100MB
+        private boolean compressPdf = true;
+        private boolean compressDocuments = true;
+        private boolean compressText = true;
+    }
     @Data
     public static class S3 {
         private String bucketName;
