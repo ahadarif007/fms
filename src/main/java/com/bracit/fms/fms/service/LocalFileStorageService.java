@@ -1,10 +1,12 @@
 package com.bracit.fms.fms.service;
 
 import com.bracit.fms.fms.config.FileStorageProperties;
+import com.bracit.fms.fms.entity.FileEntity;
 import com.bracit.fms.fms.model.FileDownloadResponse;
 import com.bracit.fms.fms.model.FileInfo;
 import com.bracit.fms.fms.model.FileUploadRequest;
 import com.bracit.fms.fms.model.ThumbnailResponse;
+import com.bracit.fms.fms.repository.FileRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -18,7 +20,6 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -28,15 +29,15 @@ import java.util.stream.Collectors;
 public class LocalFileStorageService implements FileStorageService {
 
     private final FileStorageProperties properties;
+    private final FileRepository fileRepository;
     private final ImageProcessingService imageProcessingService;
-    private final ConcurrentHashMap<String, FileInfo> fileMetadata = new ConcurrentHashMap<>();
 
     @Override
     public FileInfo uploadFile(FileUploadRequest request) {
         try {
             String fileId = UUID.randomUUID().toString();
             String fileName = generateFileName(fileId, request.getFileName());
-            Path basePath = Paths.get(properties.getLocal().getBasePath());
+            Path basePath = Paths.get(properties.getLocal().getBasePath(), request.getFileType());
 
             // Create directory if it doesn't exist
             Files.createDirectories(basePath);
@@ -67,24 +68,24 @@ public class LocalFileStorageService implements FileStorageService {
             // Save main file
             Files.write(filePath, content);
 
-            FileInfo fileInfo = FileInfo.builder()
+            FileEntity fileEntity = FileEntity.builder()
                     .id(fileId)
                     .fileName(fileName)
                     .originalFileName(request.getFileName())
                     .contentType(request.getContentType())
-                    .size(content.length)
+                    .size((long) content.length)
                     .path(filePath.toString())
                     .thumbnailPath(thumbnailPath)
                     .createdAt(LocalDateTime.now())
                     .updatedAt(LocalDateTime.now())
                     .isImage(isImage)
                     .provider("local")
+                    .fileType(request.getFileType())
                     .build();
 
-            fileMetadata.put(fileId, fileInfo);
-            log.info("File uploaded successfully: {}", fileId);
+            fileRepository.save(fileEntity);
 
-            return fileInfo;
+            return convertToFileInfo(fileEntity);
         } catch (IOException e) {
             log.error("Error uploading file: {}", e.getMessage());
             throw new RuntimeException("Failed to upload file", e);
@@ -93,13 +94,14 @@ public class LocalFileStorageService implements FileStorageService {
 
     @Override
     public Optional<FileDownloadResponse> downloadFile(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
+        Optional<FileEntity> fileEntity = fileRepository.findById(fileId);
+        if (fileEntity.isEmpty()) {
             return Optional.empty();
         }
 
+        FileEntity entity = fileEntity.get();
         try {
-            Path filePath = Paths.get(fileInfo.getPath());
+            Path filePath = Paths.get(entity.getPath());
             if (!Files.exists(filePath)) {
                 return Optional.empty();
             }
@@ -107,8 +109,8 @@ public class LocalFileStorageService implements FileStorageService {
             byte[] content = Files.readAllBytes(filePath);
 
             return Optional.of(FileDownloadResponse.builder()
-                    .fileName(fileInfo.getOriginalFileName())
-                    .contentType(fileInfo.getContentType())
+                    .fileName(entity.getOriginalFileName())
+                    .contentType(entity.getContentType())
                     .content(content)
                     .size(content.length)
                     .build());
@@ -120,42 +122,44 @@ public class LocalFileStorageService implements FileStorageService {
 
     @Override
     public Optional<FileInfo> getFileInfo(String fileId) {
-        return Optional.ofNullable(fileMetadata.get(fileId));
+        return fileRepository.findById(fileId).map(this::convertToFileInfo);
     }
 
     @Override
     public Optional<FileInfo> updateFileInfo(String fileId, FileInfo updatedFileInfo) {
-        FileInfo existingFileInfo = fileMetadata.get(fileId);
-        if (existingFileInfo == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty()) {
             return Optional.empty();
         }
 
-        existingFileInfo.setOriginalFileName(updatedFileInfo.getOriginalFileName());
-        existingFileInfo.setUpdatedAt(LocalDateTime.now());
+        FileEntity entity = entityOpt.get();
+        entity.setOriginalFileName(updatedFileInfo.getOriginalFileName());
+        entity.setUpdatedAt(LocalDateTime.now());
 
-        fileMetadata.put(fileId, existingFileInfo);
-        return Optional.of(existingFileInfo);
+        FileEntity saved = fileRepository.save(entity);
+        return Optional.of(convertToFileInfo(saved));
     }
 
     @Override
     public boolean deleteFile(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty()) {
             return false;
         }
 
+        FileEntity entity = entityOpt.get();
         try {
             // Delete main file
-            Path filePath = Paths.get(fileInfo.getPath());
+            Path filePath = Paths.get(entity.getPath());
             Files.deleteIfExists(filePath);
 
             // Delete thumbnail if exists
-            if (fileInfo.getThumbnailPath() != null) {
-                Path thumbnailPath = Paths.get(fileInfo.getThumbnailPath());
+            if (entity.getThumbnailPath() != null) {
+                Path thumbnailPath = Paths.get(entity.getThumbnailPath());
                 Files.deleteIfExists(thumbnailPath);
             }
 
-            fileMetadata.remove(fileId);
+            fileRepository.deleteById(fileId);
             log.info("File deleted successfully: {}", fileId);
             return true;
         } catch (IOException e) {
@@ -166,13 +170,14 @@ public class LocalFileStorageService implements FileStorageService {
 
     @Override
     public Optional<ThumbnailResponse> getThumbnail(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null || fileInfo.getThumbnailPath() == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty() || entityOpt.get().getThumbnailPath() == null) {
             return Optional.empty();
         }
 
+        FileEntity entity = entityOpt.get();
         try {
-            Path thumbnailPath = Paths.get(fileInfo.getThumbnailPath());
+            Path thumbnailPath = Paths.get(entity.getThumbnailPath());
             if (!Files.exists(thumbnailPath)) {
                 return Optional.empty();
             }
@@ -180,8 +185,8 @@ public class LocalFileStorageService implements FileStorageService {
             byte[] content = Files.readAllBytes(thumbnailPath);
 
             return Optional.of(ThumbnailResponse.builder()
-                    .fileName("thumb_" + fileInfo.getOriginalFileName())
-                    .contentType(fileInfo.getContentType())
+                    .fileName("thumb_" + entity.getOriginalFileName())
+                    .contentType(entity.getContentType())
                     .content(content)
                     .size(content.length)
                     .build());
@@ -193,19 +198,14 @@ public class LocalFileStorageService implements FileStorageService {
 
     @Override
     public List<FileInfo> listFiles() {
-        return fileMetadata.values().stream()
+        return fileRepository.findAll().stream()
+                .map(this::convertToFileInfo)
                 .collect(Collectors.toList());
     }
 
     @Override
     public boolean fileExists(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
-            return false;
-        }
-
-        Path filePath = Paths.get(fileInfo.getPath());
-        return Files.exists(filePath);
+        return fileRepository.existsByIdAndProvider(fileId, "local");
     }
 
     @Override
@@ -213,6 +213,22 @@ public class LocalFileStorageService implements FileStorageService {
         return "local";
     }
 
+    private FileInfo convertToFileInfo(FileEntity entity) {
+        return FileInfo.builder()
+                .id(entity.getId())
+                .fileName(entity.getFileName())
+                .originalFileName(entity.getOriginalFileName())
+                .contentType(entity.getContentType())
+                .size(entity.getSize())
+                .path(entity.getPath())
+                .thumbnailPath(entity.getThumbnailPath())
+                .createdAt(entity.getCreatedAt())
+                .updatedAt(entity.getUpdatedAt())
+                .isImage(entity.getIsImage())
+                .provider(entity.getProvider())
+                .fileType(entity.getFileType())
+                .build();
+    }
     private String generateFileName(String fileId, String originalFileName) {
         String extension = "";
         if (originalFileName != null && originalFileName.contains(".")) {

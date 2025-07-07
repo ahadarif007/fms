@@ -5,10 +5,12 @@ import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.BlobServiceClient;
 import com.azure.storage.blob.BlobServiceClientBuilder;
 import com.bracit.fms.fms.config.FileStorageProperties;
+import com.bracit.fms.fms.entity.FileEntity;
 import com.bracit.fms.fms.model.FileDownloadResponse;
 import com.bracit.fms.fms.model.FileInfo;
 import com.bracit.fms.fms.model.FileUploadRequest;
 import com.bracit.fms.fms.model.ThumbnailResponse;
+import com.bracit.fms.fms.repository.FileRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -21,7 +23,6 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -32,7 +33,7 @@ public class AzureFileStorageService implements FileStorageService {
 
     private final FileStorageProperties properties;
     private final ImageProcessingService imageProcessingService;
-    private final ConcurrentHashMap<String, FileInfo> fileMetadata = new ConcurrentHashMap<>();
+    private final FileRepository fileRepository;
     private BlobServiceClient blobServiceClient;
     private BlobContainerClient containerClient;
 
@@ -72,7 +73,7 @@ public class AzureFileStorageService implements FileStorageService {
                 if (request.isGenerateThumbnail()) {
                     byte[] thumbnailData = imageProcessingService.generateThumbnail(content, request.getContentType());
                     if (thumbnailData != null) {
-                        String thumbnailKey = "thumbnails/" + fileId + "_thumb";
+                        String thumbnailKey = request.getFileType() + "/thumbnails/" + fileId + "_thumb";
                         uploadToAzure(thumbnailKey, thumbnailData, request.getContentType());
                         thumbnailPath = thumbnailKey;
                     }
@@ -80,27 +81,26 @@ public class AzureFileStorageService implements FileStorageService {
             }
 
             // Upload main file
-            String fileKey = "files/" + fileName;
+            String fileKey = request.getFileType() + "/files/" + fileName;
             uploadToAzure(fileKey, content, request.getContentType());
 
-            FileInfo fileInfo = FileInfo.builder()
+            FileEntity fileEntity = FileEntity.builder()
                     .id(fileId)
                     .fileName(fileName)
                     .originalFileName(request.getFileName())
-                    .contentType(request.getContentType())
-                    .size(content.length)
+                    .contentType(request.getContentType()).size((long) content.length)
                     .path(fileKey)
                     .thumbnailPath(thumbnailPath)
                     .createdAt(LocalDateTime.now())
                     .updatedAt(LocalDateTime.now())
                     .isImage(isImage)
-                    .provider("azure")
+                    .provider("azure").fileType(request.getFileType())
                     .build();
 
-            fileMetadata.put(fileId, fileInfo);
+            fileRepository.save(fileEntity);
             log.info("File uploaded to Azure successfully: {}", fileId);
 
-            return fileInfo;
+            return convertToFileInfo(fileEntity);
         } catch (Exception e) {
             log.error("Error uploading file to Azure: {}", e.getMessage());
             throw new RuntimeException("Failed to upload file to Azure", e);
@@ -109,13 +109,14 @@ public class AzureFileStorageService implements FileStorageService {
 
     @Override
     public Optional<FileDownloadResponse> downloadFile(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
+        Optional<FileEntity> fileEntity = fileRepository.findById(fileId);
+        if (fileEntity.isEmpty()) {
             return Optional.empty();
         }
 
+        FileEntity entity = fileEntity.get();
         try {
-            BlobClient blobClient = containerClient.getBlobClient(fileInfo.getPath());
+            BlobClient blobClient = containerClient.getBlobClient(entity.getPath());
 
             if (!blobClient.exists()) {
                 return Optional.empty();
@@ -125,9 +126,7 @@ public class AzureFileStorageService implements FileStorageService {
             blobClient.downloadStream(outputStream);
             byte[] content = outputStream.toByteArray();
 
-            return Optional.of(FileDownloadResponse.builder()
-                    .fileName(fileInfo.getOriginalFileName())
-                    .contentType(fileInfo.getContentType())
+            return Optional.of(FileDownloadResponse.builder().fileName(entity.getOriginalFileName()).contentType(entity.getContentType())
                     .content(content)
                     .size(content.length)
                     .build());
@@ -139,43 +138,45 @@ public class AzureFileStorageService implements FileStorageService {
 
     @Override
     public Optional<FileInfo> getFileInfo(String fileId) {
-        return Optional.ofNullable(fileMetadata.get(fileId));
+        return fileRepository.findById(fileId).map(this::convertToFileInfo);
     }
 
     @Override
     public Optional<FileInfo> updateFileInfo(String fileId, FileInfo updatedFileInfo) {
-        FileInfo existingFileInfo = fileMetadata.get(fileId);
-        if (existingFileInfo == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty()) {
             return Optional.empty();
         }
 
-        existingFileInfo.setOriginalFileName(updatedFileInfo.getOriginalFileName());
-        existingFileInfo.setUpdatedAt(LocalDateTime.now());
+        FileEntity entity = entityOpt.get();
+        entity.setOriginalFileName(updatedFileInfo.getOriginalFileName());
+        entity.setUpdatedAt(LocalDateTime.now());
 
-        fileMetadata.put(fileId, existingFileInfo);
-        return Optional.of(existingFileInfo);
+        FileEntity saved = fileRepository.save(entity);
+        return Optional.of(convertToFileInfo(saved));
     }
 
     @Override
     public boolean deleteFile(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty()) {
             return false;
         }
 
+        FileEntity entity = entityOpt.get();
         try {
             // Delete main file
-            BlobClient blobClient = containerClient.getBlobClient(fileInfo.getPath());
+            BlobClient blobClient = containerClient.getBlobClient(entity.getPath());
             boolean deleted = blobClient.deleteIfExists();
 
             // Delete thumbnail if exists
-            if (fileInfo.getThumbnailPath() != null) {
-                BlobClient thumbnailBlobClient = containerClient.getBlobClient(fileInfo.getThumbnailPath());
+            if (entity.getThumbnailPath() != null) {
+                BlobClient thumbnailBlobClient = containerClient.getBlobClient(entity.getThumbnailPath());
                 thumbnailBlobClient.deleteIfExists();
             }
 
             if (deleted) {
-                fileMetadata.remove(fileId);
+                fileRepository.deleteById(fileId);
                 log.info("File deleted from Azure successfully: {}", fileId);
                 return true;
             }
@@ -188,13 +189,14 @@ public class AzureFileStorageService implements FileStorageService {
 
     @Override
     public Optional<ThumbnailResponse> getThumbnail(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null || fileInfo.getThumbnailPath() == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty() || entityOpt.get().getThumbnailPath() == null) {
             return Optional.empty();
         }
 
+        FileEntity entity = entityOpt.get();
         try {
-            BlobClient blobClient = containerClient.getBlobClient(fileInfo.getThumbnailPath());
+            BlobClient blobClient = containerClient.getBlobClient(entity.getThumbnailPath());
 
             if (!blobClient.exists()) {
                 return Optional.empty();
@@ -204,9 +206,7 @@ public class AzureFileStorageService implements FileStorageService {
             blobClient.downloadStream(outputStream);
             byte[] content = outputStream.toByteArray();
 
-            return Optional.of(ThumbnailResponse.builder()
-                    .fileName("thumb_" + fileInfo.getOriginalFileName())
-                    .contentType(fileInfo.getContentType())
+            return Optional.of(ThumbnailResponse.builder().fileName("thumb_" + entity.getOriginalFileName()).contentType(entity.getContentType())
                     .content(content)
                     .size(content.length)
                     .build());
@@ -218,24 +218,13 @@ public class AzureFileStorageService implements FileStorageService {
 
     @Override
     public List<FileInfo> listFiles() {
-        return fileMetadata.values().stream()
+        return fileRepository.findAll().stream().map(this::convertToFileInfo)
                 .collect(Collectors.toList());
     }
 
     @Override
     public boolean fileExists(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
-            return false;
-        }
-
-        try {
-            BlobClient blobClient = containerClient.getBlobClient(fileInfo.getPath());
-            return blobClient.exists();
-        } catch (Exception e) {
-            log.error("Error checking if file exists in Azure {}: {}", fileId, e.getMessage());
-            return false;
-        }
+        return fileRepository.existsByIdAndProvider(fileId, "azure");
     }
 
     @Override
@@ -254,6 +243,9 @@ public class AzureFileStorageService implements FileStorageService {
                 .setContentType(contentType));
     }
 
+    private FileInfo convertToFileInfo(FileEntity entity) {
+        return FileInfo.builder().id(entity.getId()).fileName(entity.getFileName()).originalFileName(entity.getOriginalFileName()).contentType(entity.getContentType()).size(entity.getSize()).path(entity.getPath()).thumbnailPath(entity.getThumbnailPath()).createdAt(entity.getCreatedAt()).updatedAt(entity.getUpdatedAt()).isImage(entity.getIsImage()).provider(entity.getProvider()).fileType(entity.getFileType()).build();
+    }
     private String generateFileName(String fileId, String originalFileName) {
         String extension = "";
         if (originalFileName != null && originalFileName.contains(".")) {

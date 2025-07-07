@@ -23,4 +23,5 @@ public class FileInfo {
     private LocalDateTime updatedAt;
     private boolean isImage;
     private String provider;
+    private String fileType;
 }

@@ -13,6 +13,12 @@ java {
 	}
 }
 
+configurations {
+	compileOnly {
+		extendsFrom annotationProcessor
+	}
+}
+
 repositories {
 	mavenCentral()
 }
@@ -37,6 +43,11 @@ dependencies {
 	// Azure Storage
 	implementation 'com.azure:azure-storage-blob:12.23.0'
 
+	// Database
+	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+	implementation 'com.h2database:h2'
+
+
 	// Image processing
 	implementation 'net.coobird:thumbnailator:0.4.20'
 
@@ -44,13 +55,11 @@ dependencies {
 	implementation 'org.apache.commons:commons-lang3:3.13.0'
 	implementation 'commons-io:commons-io:2.15.1'
 
+	// Lombok
 	compileOnly 'org.projectlombok:lombok'
 	annotationProcessor 'org.projectlombok:lombok'
 
 	testImplementation 'org.springframework.boot:spring-boot-starter-test'
-
-
-
 }
 
 tasks.named('test') {

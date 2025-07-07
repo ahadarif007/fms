@@ -1,10 +1,12 @@
 package com.bracit.fms.fms.service;
 
 import com.bracit.fms.fms.config.FileStorageProperties;
+import com.bracit.fms.fms.entity.FileEntity;
 import com.bracit.fms.fms.model.FileDownloadResponse;
 import com.bracit.fms.fms.model.FileInfo;
 import com.bracit.fms.fms.model.FileUploadRequest;
 import com.bracit.fms.fms.model.ThumbnailResponse;
+import com.bracit.fms.fms.repository.FileRepository;
 import io.minio.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -18,7 +20,6 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -29,7 +30,7 @@ public class MinioFileStorageService implements FileStorageService {
 
     private final FileStorageProperties properties;
     private final ImageProcessingService imageProcessingService;
-    private final ConcurrentHashMap<String, FileInfo> fileMetadata = new ConcurrentHashMap<>();
+    private final FileRepository fileRepository;
     private MinioClient minioClient;
 
     @PostConstruct
@@ -39,26 +40,23 @@ public class MinioFileStorageService implements FileStorageService {
                 .credentials(properties.getMinio().getAccessKey(), properties.getMinio().getSecretKey())
                 .build();
 
-        // Create bucket if it doesn't exist
-        try {
-            boolean bucketExists = minioClient.bucketExists(BucketExistsArgs.builder()
-                    .bucket(properties.getMinio().getBucketName())
-                    .build());
-
-            if (!bucketExists) {
-                minioClient.makeBucket(MakeBucketArgs.builder()
-                        .bucket(properties.getMinio().getBucketName())
-                        .build());
-                log.info("Created MinIO bucket: {}", properties.getMinio().getBucketName());
-            }
-        } catch (Exception e) {
-            log.error("Error initializing MinIO bucket: {}", e.getMessage());
-        }
+        log.info("MinIO client initialized successfully");
     }
 
     @Override
     public FileInfo uploadFile(FileUploadRequest request) {
         try {
+            String bucketName = request.getFileType().toLowerCase().replace("_", "-");
+            // Create bucket if it doesn't exist
+            boolean bucketExists = minioClient.bucketExists(BucketExistsArgs.builder().bucket(bucketName)
+                    .build());
+
+            if (!bucketExists) {
+                minioClient.makeBucket(MakeBucketArgs.builder().bucket(bucketName)
+                        .build());
+                log.info("Created MinIO bucket: {}", bucketName);
+            }
+
             String fileId = UUID.randomUUID().toString();
             String fileName = generateFileName(fileId, request.getFileName());
             byte[] content = request.getContent();
@@ -76,7 +74,7 @@ public class MinioFileStorageService implements FileStorageService {
                     byte[] thumbnailData = imageProcessingService.generateThumbnail(content, request.getContentType());
                     if (thumbnailData != null) {
                         String thumbnailKey = "thumbnails/" + fileId + "_thumb";
-                        uploadToMinio(thumbnailKey, thumbnailData, request.getContentType());
+                        uploadToMinio(bucketName, thumbnailKey, thumbnailData, request.getContentType());
                         thumbnailPath = thumbnailKey;
                     }
                 }
@@ -84,26 +82,24 @@ public class MinioFileStorageService implements FileStorageService {
 
             // Upload main file
             String fileKey = "files/" + fileName;
-            uploadToMinio(fileKey, content, request.getContentType());
+            uploadToMinio(bucketName, fileKey, content, request.getContentType());
 
-            FileInfo fileInfo = FileInfo.builder()
+            FileEntity fileEntity = FileEntity.builder()
                     .id(fileId)
                     .fileName(fileName)
                     .originalFileName(request.getFileName())
-                    .contentType(request.getContentType())
-                    .size(content.length)
+                    .contentType(request.getContentType()).size((long) content.length)
                     .path(fileKey)
                     .thumbnailPath(thumbnailPath)
                     .createdAt(LocalDateTime.now())
                     .updatedAt(LocalDateTime.now())
                     .isImage(isImage)
-                    .provider("minio")
+                    .provider("minio").fileType(request.getFileType())
                     .build();
 
-            fileMetadata.put(fileId, fileInfo);
-            log.info("File uploaded to MinIO successfully: {}", fileId);
+            fileRepository.save(fileEntity);
 
-            return fileInfo;
+            return convertToFileInfo(fileEntity);
         } catch (Exception e) {
             log.error("Error uploading file to MinIO: {}", e.getMessage());
             throw new RuntimeException("Failed to upload file to MinIO", e);
@@ -112,24 +108,22 @@ public class MinioFileStorageService implements FileStorageService {
 
     @Override
     public Optional<FileDownloadResponse> downloadFile(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
+        Optional<FileEntity> fileEntity = fileRepository.findById(fileId);
+        if (fileEntity.isEmpty()) {
             return Optional.empty();
         }
 
+        FileEntity entity = fileEntity.get();
+        String bucketName = entity.getFileType().toLowerCase().replace("_", "-");
         try {
-            GetObjectArgs getObjectArgs = GetObjectArgs.builder()
-                    .bucket(properties.getMinio().getBucketName())
-                    .object(fileInfo.getPath())
+            GetObjectArgs getObjectArgs = GetObjectArgs.builder().bucket(bucketName).object(entity.getPath())
                     .build();
 
             InputStream stream = minioClient.getObject(getObjectArgs);
             byte[] content = stream.readAllBytes();
             stream.close();
 
-            return Optional.of(FileDownloadResponse.builder()
-                    .fileName(fileInfo.getOriginalFileName())
-                    .contentType(fileInfo.getContentType())
+            return Optional.of(FileDownloadResponse.builder().fileName(entity.getOriginalFileName()).contentType(entity.getContentType())
                     .content(content)
                     .size(content.length)
                     .build());
@@ -141,49 +135,49 @@ public class MinioFileStorageService implements FileStorageService {
 
     @Override
     public Optional<FileInfo> getFileInfo(String fileId) {
-        return Optional.ofNullable(fileMetadata.get(fileId));
+        return fileRepository.findById(fileId).map(this::convertToFileInfo);
     }
 
     @Override
     public Optional<FileInfo> updateFileInfo(String fileId, FileInfo updatedFileInfo) {
-        FileInfo existingFileInfo = fileMetadata.get(fileId);
-        if (existingFileInfo == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty()) {
             return Optional.empty();
         }
 
-        existingFileInfo.setOriginalFileName(updatedFileInfo.getOriginalFileName());
-        existingFileInfo.setUpdatedAt(LocalDateTime.now());
+        FileEntity entity = entityOpt.get();
+        entity.setOriginalFileName(updatedFileInfo.getOriginalFileName());
+        entity.setUpdatedAt(LocalDateTime.now());
 
-        fileMetadata.put(fileId, existingFileInfo);
-        return Optional.of(existingFileInfo);
+        FileEntity saved = fileRepository.save(entity);
+        return Optional.of(convertToFileInfo(saved));
     }
 
     @Override
     public boolean deleteFile(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty()) {
             return false;
         }
 
+        FileEntity entity = entityOpt.get();
+        String bucketName = entity.getFileType().toLowerCase().replace("_", "-");
+
         try {
             // Delete main file
-            RemoveObjectArgs removeObjectArgs = RemoveObjectArgs.builder()
-                    .bucket(properties.getMinio().getBucketName())
-                    .object(fileInfo.getPath())
+            RemoveObjectArgs removeObjectArgs = RemoveObjectArgs.builder().bucket(bucketName).object(entity.getPath())
                     .build();
 
             minioClient.removeObject(removeObjectArgs);
 
             // Delete thumbnail if exists
-            if (fileInfo.getThumbnailPath() != null) {
-                RemoveObjectArgs thumbnailRemoveArgs = RemoveObjectArgs.builder()
-                        .bucket(properties.getMinio().getBucketName())
-                        .object(fileInfo.getThumbnailPath())
+            if (entity.getThumbnailPath() != null) {
+                RemoveObjectArgs thumbnailRemoveArgs = RemoveObjectArgs.builder().bucket(bucketName).object(entity.getThumbnailPath())
                         .build();
                 minioClient.removeObject(thumbnailRemoveArgs);
             }
 
-            fileMetadata.remove(fileId);
+            fileRepository.deleteById(fileId);
             log.info("File deleted from MinIO successfully: {}", fileId);
             return true;
         } catch (Exception e) {
@@ -194,24 +188,22 @@ public class MinioFileStorageService implements FileStorageService {
 
     @Override
     public Optional<ThumbnailResponse> getThumbnail(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null || fileInfo.getThumbnailPath() == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty() || entityOpt.get().getThumbnailPath() == null) {
             return Optional.empty();
         }
 
+        FileEntity entity = entityOpt.get();
+        String bucketName = entity.getFileType().toLowerCase().replace("_", "-");
         try {
-            GetObjectArgs getObjectArgs = GetObjectArgs.builder()
-                    .bucket(properties.getMinio().getBucketName())
-                    .object(fileInfo.getThumbnailPath())
+            GetObjectArgs getObjectArgs = GetObjectArgs.builder().bucket(bucketName).object(entity.getThumbnailPath())
                     .build();
 
             InputStream stream = minioClient.getObject(getObjectArgs);
             byte[] content = stream.readAllBytes();
             stream.close();
 
-            return Optional.of(ThumbnailResponse.builder()
-                    .fileName("thumb_" + fileInfo.getOriginalFileName())
-                    .contentType(fileInfo.getContentType())
+            return Optional.of(ThumbnailResponse.builder().fileName("thumb_" + entity.getOriginalFileName()).contentType(entity.getContentType())
                     .content(content)
                     .size(content.length)
                     .build());
@@ -223,28 +215,13 @@ public class MinioFileStorageService implements FileStorageService {
 
     @Override
     public List<FileInfo> listFiles() {
-        return fileMetadata.values().stream()
+        return fileRepository.findAll().stream().map(this::convertToFileInfo)
                 .collect(Collectors.toList());
     }
 
     @Override
     public boolean fileExists(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
-            return false;
-        }
-
-        try {
-            StatObjectArgs statObjectArgs = StatObjectArgs.builder()
-                    .bucket(properties.getMinio().getBucketName())
-                    .object(fileInfo.getPath())
-                    .build();
-
-            minioClient.statObject(statObjectArgs);
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
+        return fileRepository.existsByIdAndProvider(fileId, "minio");
     }
 
     @Override
@@ -252,9 +229,8 @@ public class MinioFileStorageService implements FileStorageService {
         return "minio";
     }
 
-    private void uploadToMinio(String objectName, byte[] content, String contentType) throws Exception {
-        PutObjectArgs putObjectArgs = PutObjectArgs.builder()
-                .bucket(properties.getMinio().getBucketName())
+    private void uploadToMinio(String bucketName, String objectName, byte[] content, String contentType) throws Exception {
+        PutObjectArgs putObjectArgs = PutObjectArgs.builder().bucket(bucketName)
                 .object(objectName)
                 .stream(new ByteArrayInputStream(content), content.length, -1)
                 .contentType(contentType)
@@ -263,6 +239,9 @@ public class MinioFileStorageService implements FileStorageService {
         minioClient.putObject(putObjectArgs);
     }
 
+    private FileInfo convertToFileInfo(FileEntity entity) {
+        return FileInfo.builder().id(entity.getId()).fileName(entity.getFileName()).originalFileName(entity.getOriginalFileName()).contentType(entity.getContentType()).size(entity.getSize()).path(entity.getPath()).thumbnailPath(entity.getThumbnailPath()).createdAt(entity.getCreatedAt()).updatedAt(entity.getUpdatedAt()).isImage(entity.getIsImage()).provider(entity.getProvider()).fileType(entity.getFileType()).build();
+    }
     private String generateFileName(String fileId, String originalFileName) {
         String extension = "";
         if (originalFileName != null && originalFileName.contains(".")) {

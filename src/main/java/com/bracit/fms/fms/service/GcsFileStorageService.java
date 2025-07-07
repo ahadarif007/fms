@@ -1,10 +1,12 @@
 package com.bracit.fms.fms.service;
 
 import com.bracit.fms.fms.config.FileStorageProperties;
+import com.bracit.fms.fms.entity.FileEntity;
 import com.bracit.fms.fms.model.FileDownloadResponse;
 import com.bracit.fms.fms.model.FileInfo;
 import com.bracit.fms.fms.model.FileUploadRequest;
 import com.bracit.fms.fms.model.ThumbnailResponse;
+import com.bracit.fms.fms.repository.FileRepository;
 import com.google.cloud.storage.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -18,7 +20,6 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -29,7 +30,7 @@ public class GcsFileStorageService implements FileStorageService {
 
     private final FileStorageProperties properties;
     private final ImageProcessingService imageProcessingService;
-    private final ConcurrentHashMap<String, FileInfo> fileMetadata = new ConcurrentHashMap<>();
+    private final FileRepository fileRepository;
     private Storage storage;
 
     @PostConstruct
@@ -46,13 +47,21 @@ public class GcsFileStorageService implements FileStorageService {
                         )
                 );
             }
-
             this.storage = builder.build().getService();
             log.info("GCS client initialized successfully");
         } catch (IOException e) {
             log.error("Error initializing GCS client: {}", e.getMessage());
             throw new RuntimeException("Failed to initialize GCS client", e);
         }
+    }
+
+    private void uploadToGcs(String objectName, byte[] content, String contentType) {
+        BlobId blobId = BlobId.of(properties.getGcs().getBucketName(), objectName);
+        BlobInfo blobInfo = BlobInfo.newBuilder(blobId)
+                .setContentType(contentType)
+                .build();
+
+        storage.create(blobInfo, content);
     }
 
     @Override
@@ -74,7 +83,7 @@ public class GcsFileStorageService implements FileStorageService {
                 if (request.isGenerateThumbnail()) {
                     byte[] thumbnailData = imageProcessingService.generateThumbnail(content, request.getContentType());
                     if (thumbnailData != null) {
-                        String thumbnailKey = "thumbnails/" + fileId + "_thumb";
+                        String thumbnailKey = request.getFileType() + "/thumbnails/" + fileId + "_thumb";
                         uploadToGcs(thumbnailKey, thumbnailData, request.getContentType());
                         thumbnailPath = thumbnailKey;
                     }
@@ -82,27 +91,27 @@ public class GcsFileStorageService implements FileStorageService {
             }
 
             // Upload main file
-            String fileKey = "files/" + fileName;
+            String fileKey = request.getFileType() + "/files/" + fileName;
             uploadToGcs(fileKey, content, request.getContentType());
 
-            FileInfo fileInfo = FileInfo.builder()
+            FileEntity fileEntity = FileEntity.builder()
                     .id(fileId)
                     .fileName(fileName)
                     .originalFileName(request.getFileName())
                     .contentType(request.getContentType())
-                    .size(content.length)
+                    .size((long) content.length)
                     .path(fileKey)
                     .thumbnailPath(thumbnailPath)
                     .createdAt(LocalDateTime.now())
                     .updatedAt(LocalDateTime.now())
                     .isImage(isImage)
                     .provider("gcs")
+                    .fileType(request.getFileType())
                     .build();
 
-            fileMetadata.put(fileId, fileInfo);
-            log.info("File uploaded to GCS successfully: {}", fileId);
+            fileRepository.save(fileEntity);
 
-            return fileInfo;
+            return convertToFileInfo(fileEntity);
         } catch (Exception e) {
             log.error("Error uploading file to GCS: {}", e.getMessage());
             throw new RuntimeException("Failed to upload file to GCS", e);
@@ -111,13 +120,14 @@ public class GcsFileStorageService implements FileStorageService {
 
     @Override
     public Optional<FileDownloadResponse> downloadFile(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
+        Optional<FileEntity> fileEntity = fileRepository.findById(fileId);
+        if (fileEntity.isEmpty()) {
             return Optional.empty();
         }
 
+        FileEntity entity = fileEntity.get();
         try {
-            Blob blob = storage.get(properties.getGcs().getBucketName(), fileInfo.getPath());
+            Blob blob = storage.get(properties.getGcs().getBucketName(), entity.getPath());
             if (blob == null) {
                 return Optional.empty();
             }
@@ -125,8 +135,8 @@ public class GcsFileStorageService implements FileStorageService {
             byte[] content = blob.getContent();
 
             return Optional.of(FileDownloadResponse.builder()
-                    .fileName(fileInfo.getOriginalFileName())
-                    .contentType(fileInfo.getContentType())
+                    .fileName(entity.getOriginalFileName())
+                    .contentType(entity.getContentType())
                     .content(content)
                     .size(content.length)
                     .build());
@@ -138,41 +148,43 @@ public class GcsFileStorageService implements FileStorageService {
 
     @Override
     public Optional<FileInfo> getFileInfo(String fileId) {
-        return Optional.ofNullable(fileMetadata.get(fileId));
+        return fileRepository.findById(fileId).map(this::convertToFileInfo);
     }
 
     @Override
     public Optional<FileInfo> updateFileInfo(String fileId, FileInfo updatedFileInfo) {
-        FileInfo existingFileInfo = fileMetadata.get(fileId);
-        if (existingFileInfo == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty()) {
             return Optional.empty();
         }
 
-        existingFileInfo.setOriginalFileName(updatedFileInfo.getOriginalFileName());
-        existingFileInfo.setUpdatedAt(LocalDateTime.now());
+        FileEntity entity = entityOpt.get();
+        entity.setOriginalFileName(updatedFileInfo.getOriginalFileName());
+        entity.setUpdatedAt(LocalDateTime.now());
 
-        fileMetadata.put(fileId, existingFileInfo);
-        return Optional.of(existingFileInfo);
+        FileEntity saved = fileRepository.save(entity);
+        return Optional.of(convertToFileInfo(saved));
     }
 
     @Override
     public boolean deleteFile(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty()) {
             return false;
         }
 
+        FileEntity entity = entityOpt.get();
         try {
             // Delete main file
-            boolean deleted = storage.delete(properties.getGcs().getBucketName(), fileInfo.getPath());
+            boolean deleted = storage.delete(properties.getGcs().getBucketName(), entity.getPath());
 
             // Delete thumbnail if exists
-            if (fileInfo.getThumbnailPath() != null) {
-                storage.delete(properties.getGcs().getBucketName(), fileInfo.getThumbnailPath());
+            if (entity.getThumbnailPath() != null) {
+                storage.delete(properties.getGcs().getBucketName(), entity.getThumbnailPath());
             }
 
             if (deleted) {
-                fileMetadata.remove(fileId);
+                fileRepository.deleteById(fileId);
                 log.info("File deleted from GCS successfully: {}", fileId);
                 return true;
             }
@@ -185,13 +197,14 @@ public class GcsFileStorageService implements FileStorageService {
 
     @Override
     public Optional<ThumbnailResponse> getThumbnail(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null || fileInfo.getThumbnailPath() == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty() || entityOpt.get().getThumbnailPath() == null) {
             return Optional.empty();
         }
 
+        FileEntity entity = entityOpt.get();
         try {
-            Blob blob = storage.get(properties.getGcs().getBucketName(), fileInfo.getThumbnailPath());
+            Blob blob = storage.get(properties.getGcs().getBucketName(), entity.getThumbnailPath());
             if (blob == null) {
                 return Optional.empty();
             }
@@ -199,8 +212,8 @@ public class GcsFileStorageService implements FileStorageService {
             byte[] content = blob.getContent();
 
             return Optional.of(ThumbnailResponse.builder()
-                    .fileName("thumb_" + fileInfo.getOriginalFileName())
-                    .contentType(fileInfo.getContentType())
+                    .fileName("thumb_" + entity.getOriginalFileName())
+                    .contentType(entity.getContentType())
                     .content(content)
                     .size(content.length)
                     .build());
@@ -212,24 +225,14 @@ public class GcsFileStorageService implements FileStorageService {
 
     @Override
     public List<FileInfo> listFiles() {
-        return fileMetadata.values().stream()
+        return fileRepository.findAll().stream()
+                .map(this::convertToFileInfo)
                 .collect(Collectors.toList());
     }
 
     @Override
     public boolean fileExists(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
-            return false;
-        }
-
-        try {
-            Blob blob = storage.get(properties.getGcs().getBucketName(), fileInfo.getPath());
-            return blob != null;
-        } catch (Exception e) {
-            log.error("Error checking if file exists in GCS {}: {}", fileId, e.getMessage());
-            return false;
-        }
+        return fileRepository.existsByIdAndProvider(fileId, "gcs");
     }
 
     @Override
@@ -237,13 +240,22 @@ public class GcsFileStorageService implements FileStorageService {
         return "gcs";
     }
 
-    private void uploadToGcs(String objectName, byte[] content, String contentType) {
-        BlobId blobId = BlobId.of(properties.getGcs().getBucketName(), objectName);
-        BlobInfo blobInfo = BlobInfo.newBuilder(blobId)
-                .setContentType(contentType)
+    private FileInfo convertToFileInfo(FileEntity entity) {
+        return FileInfo.builder()
+                .id(entity.getId())
+                .fileName(entity.getFileName())
+                .originalFileName(entity.getOriginalFileName())
+                .contentType(entity.getContentType())
+                .size(entity.getSize())
+                .path(entity.getPath())
+                .thumbnailPath(entity.getThumbnailPath())
+                .createdAt(entity.getCreatedAt())
+                .updatedAt(entity.getUpdatedAt())
+                .isImage(entity.getIsImage())
+                .provider(entity.getProvider())
+                .fileType(entity.getFileType())
                 .build();
 
-        storage.create(blobInfo, content);
     }
 
     private String generateFileName(String fileId, String originalFileName) {

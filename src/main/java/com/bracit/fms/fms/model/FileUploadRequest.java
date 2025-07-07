@@ -15,4 +15,5 @@ public class FileUploadRequest {
     private byte[] content;
     private boolean generateThumbnail;
     private boolean compressImage;
+    private String fileType; // e.g., "profile_picture", "NID", "documents"
 }

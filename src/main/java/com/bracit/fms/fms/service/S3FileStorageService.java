@@ -1,10 +1,12 @@
 package com.bracit.fms.fms.service;
 
 import com.bracit.fms.fms.config.FileStorageProperties;
+import com.bracit.fms.fms.entity.FileEntity;
 import com.bracit.fms.fms.model.FileDownloadResponse;
 import com.bracit.fms.fms.model.FileInfo;
 import com.bracit.fms.fms.model.FileUploadRequest;
 import com.bracit.fms.fms.model.ThumbnailResponse;
+import com.bracit.fms.fms.repository.FileRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -33,7 +35,7 @@ public class S3FileStorageService implements FileStorageService {
 
     private final FileStorageProperties properties;
     private final ImageProcessingService imageProcessingService;
-    private final ConcurrentHashMap<String, FileInfo> fileMetadata = new ConcurrentHashMap<>();
+    private final FileRepository fileRepository;
     private S3Client s3Client;
 
     @PostConstruct
@@ -68,7 +70,7 @@ public class S3FileStorageService implements FileStorageService {
                 if (request.isGenerateThumbnail()) {
                     byte[] thumbnailData = imageProcessingService.generateThumbnail(content, request.getContentType());
                     if (thumbnailData != null) {
-                        String thumbnailKey = "thumbnails/" + fileId + "_thumb";
+                        String thumbnailKey = request.getFileType() + "/thumbnails/" + fileId + "_thumb";
                         uploadToS3(thumbnailKey, thumbnailData, request.getContentType());
                         thumbnailPath = thumbnailKey;
                     }
@@ -76,27 +78,28 @@ public class S3FileStorageService implements FileStorageService {
             }
 
             // Upload main file
-            String fileKey = "files/" + fileName;
+            String fileKey = request.getFileType() + "/files/" + fileName;
             uploadToS3(fileKey, content, request.getContentType());
 
-            FileInfo fileInfo = FileInfo.builder()
+            FileEntity fileEntity = FileEntity.builder()
                     .id(fileId)
                     .fileName(fileName)
                     .originalFileName(request.getFileName())
                     .contentType(request.getContentType())
-                    .size(content.length)
+                    .size((long) content.length)
                     .path(fileKey)
                     .thumbnailPath(thumbnailPath)
                     .createdAt(LocalDateTime.now())
                     .updatedAt(LocalDateTime.now())
                     .isImage(isImage)
                     .provider("s3")
+                    .fileType(request.getFileType())
                     .build();
 
-            fileMetadata.put(fileId, fileInfo);
+            fileRepository.save(fileEntity);
             log.info("File uploaded to S3 successfully: {}", fileId);
 
-            return fileInfo;
+            return convertToFileInfo(fileEntity);
         } catch (Exception e) {
             log.error("Error uploading file to S3: {}", e.getMessage());
             throw new RuntimeException("Failed to upload file to S3", e);
@@ -105,23 +108,24 @@ public class S3FileStorageService implements FileStorageService {
 
     @Override
     public Optional<FileDownloadResponse> downloadFile(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
+        Optional<FileEntity> fileEntity = fileRepository.findById(fileId);
+        if (fileEntity.isEmpty()) {
             return Optional.empty();
         }
 
+        FileEntity entity = fileEntity.get();
         try {
             GetObjectRequest getObjectRequest = GetObjectRequest.builder()
                     .bucket(properties.getS3().getBucketName())
-                    .key(fileInfo.getPath())
+                    .key(entity.getPath())
                     .build();
 
             ResponseInputStream<GetObjectResponse> response = s3Client.getObject(getObjectRequest);
             byte[] content = response.readAllBytes();
 
             return Optional.of(FileDownloadResponse.builder()
-                    .fileName(fileInfo.getOriginalFileName())
-                    .contentType(fileInfo.getContentType())
+                    .fileName(entity.getOriginalFileName())
+                    .contentType(entity.getContentType())
                     .content(content)
                     .size(content.length)
                     .build());
@@ -133,49 +137,51 @@ public class S3FileStorageService implements FileStorageService {
 
     @Override
     public Optional<FileInfo> getFileInfo(String fileId) {
-        return Optional.ofNullable(fileMetadata.get(fileId));
+        return fileRepository.findById(fileId).map(this::convertToFileInfo);
     }
 
     @Override
     public Optional<FileInfo> updateFileInfo(String fileId, FileInfo updatedFileInfo) {
-        FileInfo existingFileInfo = fileMetadata.get(fileId);
-        if (existingFileInfo == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty()) {
             return Optional.empty();
         }
 
-        existingFileInfo.setOriginalFileName(updatedFileInfo.getOriginalFileName());
-        existingFileInfo.setUpdatedAt(LocalDateTime.now());
+        FileEntity entity = entityOpt.get();
+        entity.setOriginalFileName(updatedFileInfo.getOriginalFileName());
+        entity.setUpdatedAt(LocalDateTime.now());
 
-        fileMetadata.put(fileId, existingFileInfo);
-        return Optional.of(existingFileInfo);
+        FileEntity saved = fileRepository.save(entity);
+        return Optional.of(convertToFileInfo(saved));
     }
 
     @Override
     public boolean deleteFile(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty()) {
             return false;
         }
 
+        FileEntity entity = entityOpt.get();
         try {
             // Delete main file
             DeleteObjectRequest deleteRequest = DeleteObjectRequest.builder()
                     .bucket(properties.getS3().getBucketName())
-                    .key(fileInfo.getPath())
+                    .key(entity.getPath())
                     .build();
 
             s3Client.deleteObject(deleteRequest);
 
             // Delete thumbnail if exists
-            if (fileInfo.getThumbnailPath() != null) {
+            if (entity.getThumbnailPath() != null) {
                 DeleteObjectRequest thumbnailDeleteRequest = DeleteObjectRequest.builder()
                         .bucket(properties.getS3().getBucketName())
-                        .key(fileInfo.getThumbnailPath())
+                        .key(entity.getThumbnailPath())
                         .build();
                 s3Client.deleteObject(thumbnailDeleteRequest);
             }
 
-            fileMetadata.remove(fileId);
+            fileRepository.deleteById(fileId);
             log.info("File deleted from S3 successfully: {}", fileId);
             return true;
         } catch (Exception e) {
@@ -186,23 +192,24 @@ public class S3FileStorageService implements FileStorageService {
 
     @Override
     public Optional<ThumbnailResponse> getThumbnail(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null || fileInfo.getThumbnailPath() == null) {
+        Optional<FileEntity> entityOpt = fileRepository.findById(fileId);
+        if (entityOpt.isEmpty() || entityOpt.get().getThumbnailPath() == null) {
             return Optional.empty();
         }
 
+        FileEntity entity = entityOpt.get();
         try {
             GetObjectRequest getObjectRequest = GetObjectRequest.builder()
                     .bucket(properties.getS3().getBucketName())
-                    .key(fileInfo.getThumbnailPath())
+                    .key(entity.getThumbnailPath())
                     .build();
 
             ResponseInputStream<GetObjectResponse> response = s3Client.getObject(getObjectRequest);
             byte[] content = response.readAllBytes();
 
             return Optional.of(ThumbnailResponse.builder()
-                    .fileName("thumb_" + fileInfo.getOriginalFileName())
-                    .contentType(fileInfo.getContentType())
+                    .fileName("thumb_" + entity.getOriginalFileName())
+                    .contentType(entity.getContentType())
                     .content(content)
                     .size(content.length)
                     .build());
@@ -214,31 +221,14 @@ public class S3FileStorageService implements FileStorageService {
 
     @Override
     public List<FileInfo> listFiles() {
-        return fileMetadata.values().stream()
+        return fileRepository.findAll().stream()
+                .map(this::convertToFileInfo)
                 .collect(Collectors.toList());
     }
 
     @Override
     public boolean fileExists(String fileId) {
-        FileInfo fileInfo = fileMetadata.get(fileId);
-        if (fileInfo == null) {
-            return false;
-        }
-
-        try {
-            HeadObjectRequest headObjectRequest = HeadObjectRequest.builder()
-                    .bucket(properties.getS3().getBucketName())
-                    .key(fileInfo.getPath())
-                    .build();
-
-            s3Client.headObject(headObjectRequest);
-            return true;
-        } catch (NoSuchKeyException e) {
-            return false;
-        } catch (Exception e) {
-            log.error("Error checking if file exists in S3 {}: {}", fileId, e.getMessage());
-            return false;
-        }
+        return fileRepository.existsByIdAndProvider(fileId, "s3");
     }
 
     @Override
@@ -256,6 +246,22 @@ public class S3FileStorageService implements FileStorageService {
         s3Client.putObject(putObjectRequest, RequestBody.fromBytes(content));
     }
 
+    private FileInfo convertToFileInfo(FileEntity entity) {
+        return FileInfo.builder()
+                .id(entity.getId())
+                .fileName(entity.getFileName())
+                .originalFileName(entity.getOriginalFileName())
+                .contentType(entity.getContentType())
+                .size(entity.getSize())
+                .path(entity.getPath())
+                .thumbnailPath(entity.getThumbnailPath())
+                .createdAt(entity.getCreatedAt())
+                .updatedAt(entity.getUpdatedAt())
+                .isImage(entity.getIsImage())
+                .provider(entity.getProvider())
+                .fileType(entity.getFileType())
+                .build();
+    }
     private String generateFileName(String fileId, String originalFileName) {
         String extension = "";
         if (originalFileName != null && originalFileName.contains(".")) {
